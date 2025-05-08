@@ -1,0 +1,255 @@
+
+---
+title: "hyperparameter-tuning"
+format: html
+author: "Libby Prince"
+execute: 
+  echo: true
+---
+Data Import/Tidy/Transform:
+  Library Loading	
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(skimr)
+library(visdat)
+library(ggpubr)
+library(tibble)
+```
+  Data Ingest	
+```{r}
+# Load necessary libraries
+library(purrr)
+library(readr)
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+
+install.packages("here")
+setwd("/Users/libbyprince/github/lab8") 
+
+# Define file paths
+file_paths <- c(
+  "data/camels_clim.txt",
+  "data/camels_geol.txt",
+  "data/camels_hydro.txt",
+  "data/camels_soil.txt",
+  "data/camels_topo.txt",
+  "data/camels_vege.txt"
+)
+camels_geol <- read_delim("data/camels_geol.txt", delim = ";")
+
+# Use map() to read all files and store them in a list
+camels_data_list <- map(file_paths, ~ read_delim(.x, delim = ";"))
+# Combine all data into one data frame
+camels_full <- bind_rows(camels_data_list)
+```
+  Data Cleaning
+```{r}
+install.packages("tibble")
+
+library(tibble)
+glimpse(camels_full)
+skim(camels_full)
+vis_dat(camels_full)
+camels_clean <- camels_full %>%
+  filter(!is.na(q_mean), is.finite(q_mean)) %>%
+  select(gauge_id, gauge_lat, gauge_lon, everything())
+```
+Data Spiting:
+  Initial Split	
+```{r}
+# Load necessary libraries
+library(tidymodels)
+library(rsample)  # Load rsample for initial_split
+
+# Split the data into training and testing sets
+split <- initial_split(camels_clean, prop = 0.8)
+train <- training(split)
+test <- testing(split)
+```
+Feature Engineering:
+  Proper Recipe
+```{r}
+rec <- recipe(q_mean ~ ., data = train) %>%
+  step_rm(gauge_lat, gauge_lon, gauge_id) %>%
+  step_zv(all_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%     # NEW — handle new/unseen categories
+  step_unknown(all_nominal_predictors()) %>%   # NEW — handle missing (NA) categories
+  step_dummy(all_nominal_predictors()) %>%     # THEN do dummy encoding
+  step_corr(all_numeric_predictors(), threshold = 0.9) %>%
+  step_normalize(all_numeric_predictors())
+```
+Data Resampling and Model Testing:
+  Cross Validation Dataset (k-folds)
+```{r}
+set.seed(330)
+folds <- vfold_cv(train, v = 10)
+```
+ 
+ Define Three Regression Models
+```{r}
+# Linear regression
+lm_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+# Random forest
+rf_spec <- rand_forest(trees = 100) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+# XGBoost
+xgb_spec <- boost_tree(trees = 100) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+ 
+  Workflow Set/Map/Autoplot	
+```{r}
+install.packages("ranger")
+library(ranger)
+
+wf_set <- workflow_set(
+  preproc = list(rec),
+  models = list(lm = lm_spec, rf = rf_spec, xgb = xgb_spec)
+)
+wf_results <- wf_set %>%
+  workflow_map(resamples = folds, metrics = metric_set(rmse, rsq, mae))
+autoplot(wf_results)
+```
+  
+  Model Selection with Justification	
+```{r}
+# Print results to decide best model
+collect_metrics(wf_results)
+```
+The best model was the XGBoost because it had the lowest mean absolute error of 0.1075, a low RMSE f 0.211, and a high R^2 of 0.983. These results show that the model makes accurate predictions with small errors. 
+
+Model Tuning:
+  Tunable model setup	
+```{r}
+xgb_model <- boost_tree(
+  mode = "regression",
+  mtry = tune(),
+  min_n = tune(),
+  trees = 1000
+) %>%
+  set_engine("xgboost")
+```
+  
+  Tunable workflow defined	
+```{r}
+camels_recipe <- recipe(q_mean ~ ., data = train) %>%
+  update_role(gauge_id, new_role = "ID") %>%
+  step_nzv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+xgb_workflow <- workflow() %>%
+  add_model(xgb_model) %>%
+  add_recipe(camels_recipe)
+```
+  
+  Description of dial ranges
+```{r}
+xgb_grid <- grid_regular(
+  mtry(range = c(3, 50)),
+  min_n(range = c(2, 40)),
+  levels = 5
+)
+```
+  Defined Search Space	
+ 
+  Executed Tune Grid
+```{r}
+set.seed(123)
+xgb_res <- tune_grid(
+  xgb_workflow,
+  resamples = vfold_cv(train, v = 10),
+  grid = xgb_grid,
+  metrics = metric_set(mae, rmse, rsq)
+)
+```
+
+
+Check the skill of the tuned mode:
+Collect Metrics/Show Best/Describe in Plain Language
+```{r}
+show_best(xgb_res, metric = "mae", n = 5)
+```
+The mtry and min_n combinations that resulted in the MAE were mtry=50 and min_n=11. This was the best performance with the smallest average error and lowest standard error, showing consistent results. 
+
+Finalize your mode:
+  Finalize Workflow
+```{r}
+best_params <- select_best(xgb_res, metric = "mae")
+final_xgb_workflow <- finalize_workflow(
+  xgb_workflow,
+  best_params
+)
+```
+
+Final Model Verification:
+Implement the last fit
+```{r}
+last_xgb_fit <- last_fit(final_xgb_workflow, split)
+```
+Interpret Metrics
+```{r}
+collect_metrics(last_xgb_fit)
+```
+Plot Predictions
+```{r}
+collect_predictions(last_xgb_fit) %>%
+  ggplot(aes(x = .pred, y = q_mean)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Observed Q_mean", x = "Predicted", y = "Observed") +
+  theme_minimal()
+```
+```{r}
+# 1. Fit the final model
+final_xgb_fit <- fit(final_xgb_workflow, data = camels_clean)
+
+# 2. Predict with trained model and calculate residuals
+predictions <- predict(final_xgb_fit, new_data = camels_clean) %>%
+  bind_cols(camels_clean %>% select(q_mean, gauge_id, gauge_lat, gauge_lon)) %>%
+  mutate(residuals = q_mean - .pred)
+
+```
+
+Final Figure:
+```{r}
+# Load required packages if not already loaded
+library(ggplot2)
+library(patchwork)
+
+# Prediction map
+pred_map <- predictions %>%
+  ggplot(aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c(option = "plasma") +
+  labs(
+    title = "Predicted Mean Streamflow",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Prediction"
+  ) +
+  theme_minimal()
+# Residual map
+resid_map <- predictions %>%
+  ggplot(aes(x = gauge_lon, y = gauge_lat, color = residuals^2)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c(option = "inferno") +
+  labs(
+    title = "Squared Residuals of Predictions",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Residual²"
+  ) +
+  theme_minimal()
+# Combine the two maps into one figure
+pred_map + resid_map +
+  plot_annotation(title = "Predicted Streamflow and Residuals Across CONUS")
+```
+
